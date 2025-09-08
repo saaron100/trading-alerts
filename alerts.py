@@ -1,102 +1,65 @@
-import os, requests, yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import requests
+import yfinance as yf
+import ta
+import os
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-TICKERS = ["SPY","AAPL","CVX","AMZN","QQQ","GLD","SLV","PLTR","USO",
-           "NFLX","TNA","XOM","NVDA","BAC","TSLA","META"]
-
-STATE_FILE = "last_signals.txt"
+# Telegram bot setup
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_message(text):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.get(url, params={"chat_id": CHAT_ID, "text": text})
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        r = requests.post(url, json=payload)
+        r.raise_for_status()
+    except Exception as e:
+        print("Error sending message:", e)
 
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def ema(series, period=20):
-    return series.ewm(span=period, adjust=False).mean()
-
-def next_friday():
-    today = datetime.today()
-    days_ahead = 4 - today.weekday()  # 4 = Friday
-    if days_ahead <= 0:
-        days_ahead += 7
-    return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-
-def round_strike(price):
-    if price < 50:
-        return round(price)  # $1 steps
-    elif price < 200:
-        return int(round(price / 2.5) * 2.5)  # $2.5 steps
-    else:
-        return int(round(price / 5) * 5)  # $5 steps
-
-def confidence_score(signal_type, rsi_val, close, ema_val, candle_green):
-    score = 1
-    if signal_type == "CALL":
-        if rsi_val < 25: score += 1
-        if close > ema_val: score += 1
-        if candle_green: score += 1
-    elif signal_type == "PUT":
-        if rsi_val > 75: score += 1
-        if close < ema_val: score += 1
-        if not candle_green: score += 1
-    return min(score, 3)
+# Tick list
+TICKERS = ["SPY","AAPL","CVX","AMZN","QQQ","GLD","SLV","PLTR",
+           "USO","NFLX","TNA","XOM","NVDA","BAC","TSLA","META"]
 
 def analyze_ticker(ticker):
-    df = yf.download(ticker, period="3mo", interval="30m")
-    if df.empty: return None
-    df["RSI"] = rsi(df["Close"])
-    df["EMA20"] = ema(df["Close"], 20)
+    df = yf.download(ticker, period="6mo", interval="15m")
+    if df.empty:
+        return None
+
+    # Indicators
+    df["EMA20"] = ta.trend.EMAIndicator(df["Close"], window=20).ema_indicator()
+    df["EMA50"] = ta.trend.EMAIndicator(df["Close"], window=50).ema_indicator()
+    df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
 
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    price = last["Close"]
-    expiry = next_friday()
-    strike = round_strike(price)
-    candle_green = last["Close"] > last["Open"]
 
-    if last["RSI"] < 30 and last["Close"] > last["EMA20"]:
-        score = confidence_score("CALL", last["RSI"], price, last["EMA20"], candle_green)
-        return f"🚨 {ticker}: CALL {strike}c exp {expiry} | Entry ~ {price:.2f} | {score}⭐"
-    elif last["RSI"] > 70 and last["Close"] < last["EMA20"]:
-        score = confidence_score("PUT", last["RSI"], price, last["EMA20"], candle_green)
-        return f"🚨 {ticker}: PUT {strike}p exp {expiry} | Entry ~ {price:.2f} | {score}⭐"
+    signal = None
+    score = 0
+
+    # Conditions
+    if last["EMA20"] > last["EMA50"] and last["RSI"] > 55:
+        signal = "CALL"
+        score += 1
+    if last["EMA20"] < last["EMA50"] and last["RSI"] < 45:
+        signal = "PUT"
+        score += 1
+
+    if signal:
+        return f"{ticker}: {signal} ⭐ Score: {score}"
     return None
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return set()
-    with open(STATE_FILE, "r") as f:
-        return set(line.strip() for line in f)
-
-def save_state(signals):
-    with open(STATE_FILE, "w") as f:
-        for s in signals:
-            f.write(s + "\n")
-
 def main():
-    last_signals = load_state()
-    new_signals = set()
+    messages = []
+    for ticker in TICKERS:
+        result = analyze_ticker(ticker)
+        if result:
+            messages.append(result)
 
-    for t in TICKERS:
-        sig = analyze_ticker(t)
-        if sig and sig not in last_signals:
-            send_message(f"{sig}")
-            new_signals.add(sig)
+    if messages:
+        send_message("📊 New Signals:\n" + "\n".join(messages))
+    else:
+        print("No signals this run.")
 
-    if new_signals:
-        save_state(last_signals.union(new_signals))
-
+# ---------- TEST LINE ----------
 if __name__ == "__main__":
     main()
-
+    send_message("✅ TEST MESSAGE: Signals system is working with ⭐ scoring")
