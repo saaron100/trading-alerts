@@ -1,0 +1,40 @@
+name: Trading Alerts
+
+on:
+  schedule:
+    - cron: "*/15 13-20 * * 1-5"   # every 15 minutes during US market hours (UTC 13-20)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # allow committing state.json back
+
+jobs:
+  run-alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Run alerts
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python alerts.py
+
+      - name: Commit state (if changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ `git status --porcelain` ]]; then
+            git add state.json || true
+            git commit -m "update state $(date -u +'%Y-%m-%d %H:%M:%S')"
+            git push
+          fi
