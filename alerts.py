@@ -40,6 +40,18 @@ def round_strike(price):
     else:
         return int(round(price / 5) * 5)  # $5 steps
 
+def confidence_score(signal_type, rsi_val, close, ema_val, candle_green):
+    score = 1
+    if signal_type == "CALL":
+        if rsi_val < 25: score += 1
+        if close > ema_val: score += 1
+        if candle_green: score += 1
+    elif signal_type == "PUT":
+        if rsi_val > 75: score += 1
+        if close < ema_val: score += 1
+        if not candle_green: score += 1
+    return min(score, 3)
+
 def analyze_ticker(ticker):
     df = yf.download(ticker, period="3mo", interval="30m")
     if df.empty: return None
@@ -47,14 +59,18 @@ def analyze_ticker(ticker):
     df["EMA20"] = ema(df["Close"], 20)
 
     last = df.iloc[-1]
+    prev = df.iloc[-2]
     price = last["Close"]
     expiry = next_friday()
     strike = round_strike(price)
+    candle_green = last["Close"] > last["Open"]
 
     if last["RSI"] < 30 and last["Close"] > last["EMA20"]:
-        return f"🚨 {ticker}: CALL {strike}c exp {expiry} | Entry ~ {price:.2f}"
+        score = confidence_score("CALL", last["RSI"], price, last["EMA20"], candle_green)
+        return f"🚨 {ticker}: CALL {strike}c exp {expiry} | Entry ~ {price:.2f} | {score}⭐"
     elif last["RSI"] > 70 and last["Close"] < last["EMA20"]:
-        return f"🚨 {ticker}: PUT {strike}p exp {expiry} | Entry ~ {price:.2f}"
+        score = confidence_score("PUT", last["RSI"], price, last["EMA20"], candle_green)
+        return f"🚨 {ticker}: PUT {strike}p exp {expiry} | Entry ~ {price:.2f} | {score}⭐"
     return None
 
 def load_state():
@@ -83,3 +99,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
