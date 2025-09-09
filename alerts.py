@@ -22,7 +22,7 @@ def get_data(ticker):
             raise Exception("Intraday empty, switching to daily")
     except:
         # Fallback to daily data (3 months)
-        data = yf.download(ticker, period="3mo", interval="1d")
+        data = get_data(ticker)
     return data
 
 
