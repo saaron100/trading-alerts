@@ -2,11 +2,11 @@ name: Trading Alerts
 
 on:
   schedule:
-    - cron: "*/15 13-20 * * 1-5"   # every 15 minutes during US market hours (UTC 13-20)
+    - cron: "*/15 13-20 * * 1-5"   # every 15 minutes Mon-Fri (UTC window matches US market hours)
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # allow committing state.json back
+  contents: write
 
 jobs:
   run-alerts:
