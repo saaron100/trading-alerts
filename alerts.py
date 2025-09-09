@@ -12,6 +12,19 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
+import yfinance as yf
+
+def get_data(ticker):
+    try:
+        # Try intraday (15m candles, last 60 days max)
+        data = yf.download(ticker, period="60d", interval="15m")
+        if data.empty:
+            raise Exception("Intraday empty, switching to daily")
+    except:
+        # Fallback to daily data (3 months)
+        data = yf.download(ticker, period="3mo", interval="1d")
+    return data
+
 
 # --------- USER CONFIG ----------
 TICKERS = ["SPY","AAPL","CVX","AMZN","QQQ","GLD","SLV","PLTR",
