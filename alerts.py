@@ -711,3 +711,4 @@ if __name__ == "__main__":
     else:
         # normal scheduled-run mode: run once (good for GitHub Actions schedule)
         main_run_once()
+
