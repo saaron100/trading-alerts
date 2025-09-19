@@ -1,64 +1,72 @@
-# alerts.py
-# Full Trading Alerts + Telegram command handler
-# - Uses yfinance for prices and option chains (with intraday -> daily fallback)
-# - Sends Telegram messages via bot API
-# - Processes Telegram messages via getUpdates (suitable for scheduled runs)
-# - Optional local immediate listener (python-telegram-bot) if you run locally
+#!/usr/bin/env python3
+# alerts_upgraded.py
+# Cloud-ready trading alerts for GitHub Actions (run once per schedule).
+# - Sends Telegram alerts
+# - Detects RSI, EMA, Hammer/Hanging Man/Doji, Bollinger breakout, volume spike
+# - Picks ATM option (yfinance), builds recommendation message
+# - Processes simple Telegram commands via getUpdates
 #
-# Requirements:
-#   pip install yfinance pandas numpy requests
-# Optional (for local mode):
-#   pip install python-telegram-bot==13.15
+# Requirements (put in requirements.txt):
+# yfinance
+# pandas
+# numpy
+# requests
 #
-# Environment:
-#   TELEGRAM_BOT_TOKEN  (required)
-#   TELEGRAM_CHAT_ID    (required)
+# Environment variables (set these in GitHub Secrets):
+# TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 #
-# State file: state.json (committed back by workflow so state persists)
+# Usage:
+# - Run once per schedule (GitHub Actions). It will load/save state.json in repo workspace.
+# - To persist state between runs, configure your GitHub Actions workflow to commit state.json back (optional).
+#
+# Keep it simple and test with DEBUG_FORCE_TEST=True first.
 
 import os
 import json
-import math
 import time
-import requests
 import traceback
 from datetime import datetime, date, timedelta
 
+import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
 
-# Optional local listener import (only required if you run with --local)
-try:
-    from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
-    TELEGRAM_BOTLIB_AVAILABLE = True
-except Exception:
-    TELEGRAM_BOTLIB_AVAILABLE = False
-
-# ---------------- CONFIG ----------------
+# ---------------- CONFIG (tweak these) ----------------
 TICKERS = ["SPY","AAPL","CVX","AMZN","QQQ","GLD","SLV","PLTR",
            "USO","NFLX","TNA","XOM","NVDA","BAC","TSLA","META"]
 
 STATE_FILE = "state.json"
+
+# Indicator settings
 RSI_PERIOD = 14
 EMA_SHORT = 20
 EMA_LONG = 50
 
+# Looser RSI thresholds (we agreed to test these)
+RSI_BUY_THRESHOLD = 40
+RSI_SELL_THRESHOLD = 60
+
+# Option & trade helpers
 DEFAULT_QTY = 1
-TAKE_PROFIT_PCT = 0.50   # notify when +50%
+TAKE_PROFIT_PCT = 0.50   # notify when +50% (0.50 => 50%)
 STOP_LOSS_PCT   = -0.30  # notify when -30%
 
-# Environment variables (required)
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-
-# Some internal settings
-INTRADAY_TRY_PERIODS = [ "7d", "30d", "60d" ]  # attempt intraday periods in order
+# Data fetch settings
+INTRADAY_TRY_PERIODS = ["7d", "30d", "60d"]
 INTRADAY_INTERVAL = "15m"
 FALLBACK_DAILY_PERIOD = "3mo"
 FALLBACK_DAILY_INTERVAL = "1d"
 
-# ----------------- Helpers -----------------
+# Debug/test
+DEBUG_FORCE_TEST = False   # set True to send one fake alert (turn off after)
+DEBUG_TEST_TICKER = "TSLA"
+
+# ---------------- Environment (Telegram) ----------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# ---------------- Helpers ----------------
 def send_telegram(text):
     """Send text message to configured Telegram chat."""
     if not BOT_TOKEN or not CHAT_ID:
@@ -72,7 +80,7 @@ def send_telegram(text):
             j = r.json()
         except Exception:
             j = None
-        print("Telegram send:", r.status_code, (j if j else r.text)[:200])
+        print("Telegram send:", r.status_code, (j if j else str(r.text))[:200])
         return j
     except Exception as e:
         print("send_telegram error:", e)
@@ -97,26 +105,19 @@ def get_updates(offset=None, timeout=5):
         print("get_updates error:", e)
         return []
 
-# ----------------- Data fetch (robust) -----------------
+# ---------------- Data fetch (robust) ----------------
 def get_data(ticker):
-    """
-    Try intraday first (several short periods). If that fails or yields empty,
-    fallback to daily data.
-    """
-    # Prefer smaller intraday window to reduce Yahoo errors
+    # Try intraday windows first, fallback to daily
     for p in INTRADAY_TRY_PERIODS:
         try:
-            df = yf.download(ticker, period=p, interval=INTRADAY_INTERVAL, progress=False)
+            df = yf.download(ticker, period=p, interval=INTRADAY_INTERVAL, progress=False, auto_adjust=True)
             if df is not None and not df.empty:
-                # if index is timezone-aware, convert to naive to avoid future confusion
                 return df
         except Exception as e:
-            # log and try next period
             print(f"{ticker} intraday attempt period={p} failed: {e}")
             continue
-    # fallback to daily
     try:
-        df = yf.download(ticker, period=FALLBACK_DAILY_PERIOD, interval=FALLBACK_DAILY_INTERVAL, progress=False)
+        df = yf.download(ticker, period=FALLBACK_DAILY_PERIOD, interval=FALLBACK_DAILY_INTERVAL, progress=False, auto_adjust=True)
         if df is None:
             return pd.DataFrame()
         return df
@@ -124,7 +125,7 @@ def get_data(ticker):
         print("get_data fallback failed for", ticker, e)
         return pd.DataFrame()
 
-# ----------------- Technicals -----------------
+# ---------------- Technical indicators ----------------
 def compute_rsi(series: pd.Series, period=14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0)
@@ -138,29 +139,82 @@ def compute_rsi(series: pd.Series, period=14) -> pd.Series:
 def compute_ema(series: pd.Series, period=20) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-# ----------------- Option expiry & strike helpers -----------------
-def parse_expirations(exp_list):
-    exps = []
-    for s in exp_list:
+# ---------------- Candlestick patterns ----------------
+def detect_candlestick_pattern(df):
+    """
+    Detect Hammer, Hanging Man, Doji on the last candle.
+    Returns 'HAMMER','HANGING_MAN','DOJI' or None.
+    """
+    if len(df) < 1:
+        return None
+    last = df.iloc[-1]
+    o = float(last["Open"])
+    h = float(last["High"])
+    l = float(last["Low"])
+    c = float(last["Close"])
+
+    body = abs(c - o)
+    rng = h - l
+    if rng == 0:
+        return None
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    # Hammer/hanging-man shape: small body, long lower wick
+    if body <= rng * 0.35 and lower >= body * 2 and upper <= body:
+        # need context to decide hammer vs hanging man; return generic and let analyze decide
+        return "HAMMER"
+
+    # Doji: very small body
+    if body <= rng * 0.1:
+        return "DOJI"
+
+    return None
+
+def recent_trend_up(close_series, lookback=5):
+    try:
+        if len(close_series) < lookback + 1:
+            return False
+        return float(close_series.iloc[-1]) > float(close_series.iloc[-lookback-1])
+    except Exception:
+        return False
+
+# ---------------- Bollinger & Volume helpers ----------------
+def bollinger_breakout(df, period=20, nbdev=2):
+    close = df["Close"]
+    if len(close) < period + 1:
+        return None
+    ma = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    upper = ma + nbdev * std
+    lower = ma - nbdev * std
+    last = float(close.iloc[-1])
+    if last > upper.iloc[-1]:
+        return "upper"
+    if last < lower.iloc[-1]:
+        return "lower"
+    return None
+
+def is_volume_spike(df, lookback=20, spike_factor=1.5):
+    if "Volume" not in df.columns or len(df["Volume"]) < lookback + 1:
+        return False
+    mean_vol = df["Volume"].iloc[-(lookback+1):-1].mean()
+    return df["Volume"].iloc[-1] >= mean_vol * spike_factor
+
+# ---------------- Option helpers (yfinance) ----------------
+def choose_expiry_by_score(ticker_obj, score):
+    exps = ticker_obj.options
+    parsed = []
+    for s in exps:
         try:
-            dtobj = datetime.strptime(s, "%Y-%m-%d").date()
-            exps.append((dtobj, s))
+            dt = datetime.strptime(s, "%Y-%m-%d").date()
+            parsed.append((dt, s))
         except Exception:
             continue
-    exps.sort()
-    return exps
-
-def choose_expiry_by_score(ticker_obj, score):
-    """
-    Choose expiry (string 'YYYY-MM-DD') based on 5-star score.
-    Higher score -> prefer nearer expirations.
-    """
-    exps = ticker_obj.options
-    parsed = parse_expirations(exps)
+    parsed.sort()
     if not parsed:
         return None
     today = date.today()
-    # ranges in days (min,max)
     ranges = {
         5: (0, 7),
         4: (0, 14),
@@ -172,14 +226,12 @@ def choose_expiry_by_score(ticker_obj, score):
     candidates = [s for (d,s) in parsed if low <= (d - today).days <= max(1, high)]
     if candidates:
         return candidates[0]
-    # fallback nearest future
     for (d,s) in parsed:
         if (d - today).days >= 0:
             return s
     return parsed[-1][1]
 
 def pick_atm_contract(ticker, expiry, is_call, spot):
-    """Return best ATM contract dict for the given expiry or None."""
     try:
         t = yf.Ticker(ticker)
         chain = t.option_chain(expiry)
@@ -191,13 +243,13 @@ def pick_atm_contract(ticker, expiry, is_call, spot):
         row = table.sort_values("dist").iloc[0]
         bid = float(row.get("bid") or 0)
         ask = float(row.get("ask") or 0)
-        last = float(row.get("lastPrice") or 0)
-        if bid > 0 and ask > 0:
-            mid = round((bid + ask) / 2, 2)
+        lastp = float(row.get("lastPrice") or 0)
+        if bid>0 and ask>0:
+            mid = round((bid+ask)/2, 2)
         else:
-            mid = round(last if last > 0 else max(bid, ask), 2)
+            mid = round(lastp if lastp>0 else max(bid,ask), 2)
         return {
-            "contract": row.get("contractSymbol", ""),
+            "contract": row.get("contractSymbol",""),
             "strike": float(row["strike"]),
             "bid": bid,
             "ask": ask,
@@ -205,11 +257,10 @@ def pick_atm_contract(ticker, expiry, is_call, spot):
             "inTheMoney": bool(row.get("inTheMoney", False))
         }
     except Exception as e:
-        print("pick_atm_contract error for", ticker, expiry, e)
+        print("pick_atm_contract error:", e)
         return None
 
 def current_option_mid_by_contract(ticker, contract_symbol, expiry, opt_type, strike):
-    """Return current mid price (float) for a given contract symbol/strike."""
     try:
         t = yf.Ticker(ticker)
         chain = t.option_chain(expiry)
@@ -221,63 +272,51 @@ def current_option_mid_by_contract(ticker, contract_symbol, expiry, opt_type, st
                 return None
         bid = float(row.iloc[0].get("bid") or 0)
         ask = float(row.iloc[0].get("ask") or 0)
-        last = float(row.iloc[0].get("lastPrice") or 0)
-        if bid > 0 and ask > 0:
-            return round((bid + ask) / 2, 2)
-        return round(last if last > 0 else max(bid, ask), 2)
+        lastp = float(row.iloc[0].get("lastPrice") or 0)
+        if bid>0 and ask>0:
+            return round((bid+ask)/2, 2)
+        return round(lastp if lastp>0 else max(bid,ask), 2)
     except Exception as e:
         print("current_option_mid error:", e)
         return None
 
-# ----------------- Scoring logic (5-star) -----------------
-def score_signal_5star(signal_type, rsi_val, close, ema_s, ema_l, volume_series):
+# ---------------- Scoring function (1-5 stars) ----------------
+def score_signals(df, signal_type, rsi_val, ema_s_val, ema_l_val):
     score = 1
-    vol_spike = False
-    try:
-        if len(volume_series) >= 20:
-            mean_vol = np.nanmean(volume_series[-20:])
-            if mean_vol > 0 and volume_series.iloc[-1] > mean_vol * 1.5:
-                vol_spike = True
-    except Exception:
-        vol_spike = False
+    reasons = []
 
+    # Price confirmation with EMAs
     if signal_type == "CALL":
-        if rsi_val < 15:
-            score += 2
-        elif rsi_val < 22:
+        if ema_s_val > ema_l_val:
             score += 1
-        if ema_s > ema_l:
+            reasons.append("EMA trend")
+        if rsi_val is not None and rsi_val < RSI_BUY_THRESHOLD:
             score += 1
-        if (close > ema_s) and vol_spike:
+            reasons.append(f"RSI{int(rsi_val)}")
+        if bollinger_breakout(df) == "upper":
             score += 1
+            reasons.append("Bollinger upper")
+        if is_volume_spike(df):
+            score += 1
+            reasons.append("Volume spike")
     else:  # PUT
-        if rsi_val > 85:
-            score += 2
-        elif rsi_val > 78:
+        if ema_s_val < ema_l_val:
             score += 1
-        if ema_s < ema_l:
+            reasons.append("EMA trend")
+        if rsi_val is not None and rsi_val > RSI_SELL_THRESHOLD:
             score += 1
-        if (close < ema_s) and vol_spike:
+            reasons.append(f"RSI{int(rsi_val)}")
+        if bollinger_breakout(df) == "lower":
             score += 1
+            reasons.append("Bollinger lower")
+        if is_volume_spike(df):
+            score += 1
+            reasons.append("Volume spike")
 
-    return max(1, min(5, score))
+    score = max(1, min(5, score))
+    return int(score), reasons
 
-def expiry_label(expiry_str):
-    try:
-        e = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-        today = date.today()
-        days = (e - today).days
-        if days <= 7:
-            return f"{expiry_str} (this week)"
-        elif days <= 14:
-            return f"{expiry_str} (next week)"
-        elif days <= 30:
-            return f"{expiry_str} (1–4 weeks)"
-        return expiry_str
-    except Exception:
-        return expiry_str
-
-# ----------------- State persistence -----------------
+# ---------------- State persistence ----------------
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {
@@ -307,43 +346,58 @@ def save_state(state):
     except Exception as e:
         print("save_state error:", e)
 
-# ----------------- Analysis per ticker -----------------
+# ---------------- Analyze ticker (main logic) ----------------
 def analyze_ticker(ticker):
+    """
+    Returns dict with keys:
+      - ticker
+      - message
+      - signature
+      - suggestion (contract info)
+    Or None if no signal.
+    """
     try:
         df = get_data(ticker)
         if df is None or df.empty or "Close" not in df.columns:
             return None
 
         close_series = df["Close"].dropna()
-        if len(close_series) < RSI_PERIOD + 2:
+        if len(close_series) < max(RSI_PERIOD, EMA_LONG) + 2:
             return None
 
+        # Indicators
         rsi_series = compute_rsi(close_series, RSI_PERIOD)
+        rsi_val = float(rsi_series.iloc[-1]) if len(rsi_series)>0 else None
         ema_s = compute_ema(close_series, EMA_SHORT)
         ema_l = compute_ema(close_series, EMA_LONG)
+        ema_s_val = float(ema_s.iloc[-1])
+        ema_l_val = float(ema_l.iloc[-1])
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
-
-        rsi_val = float(rsi_series.iloc[-1])
         close_price = float(last["Close"])
-        ema_short_val = float(ema_s.iloc[-1])
-        ema_long_val = float(ema_l.iloc[-1])
-        candle_green = float(last["Close"]) > float(last.get("Open", last["Close"]))
-        volume_series = df["Volume"] if "Volume" in df.columns else pd.Series([])
 
+        # Candle pattern & context
+        pattern = detect_candlestick_pattern(df)
+        uptrend = recent_trend_up(close_series, lookback=5)
+
+        # Decide direction with looser RSI thresholds + candle confirmations
         signal_type = None
-        # Strict directional rules
-        if rsi_val < 30 and ema_short_val > ema_long_val and close_price > ema_short_val:
+        # CALL logic
+        if (rsi_val is not None and rsi_val < RSI_BUY_THRESHOLD and ema_s_val > ema_l_val and close_price > ema_s_val) or (pattern == "HAMMER" and not uptrend):
             signal_type = "CALL"
-        elif rsi_val > 70 and ema_short_val < ema_long_val and close_price < ema_short_val:
+        # PUT logic
+        elif (rsi_val is not None and rsi_val > RSI_SELL_THRESHOLD and ema_s_val < ema_l_val and close_price < ema_s_val) or (pattern == "HAMMER" and uptrend):
+            # treat hammer after uptrend as hanging/man -> bearish
             signal_type = "PUT"
 
         if not signal_type:
             return None
 
-        score = score_signal_5star(signal_type, rsi_val, close_price, ema_short_val, ema_long_val, volume_series)
+        # Score & reasons
+        score, reasons = score_signals(df, signal_type, rsi_val, ema_s_val, ema_l_val)
 
+        # Option expiry and contract
         tkr = yf.Ticker(ticker)
         expiry = choose_expiry_by_score(tkr, score)
         if not expiry:
@@ -354,8 +408,7 @@ def analyze_ticker(ticker):
         if not opt:
             return None
 
-        est_cost = opt["mid"] * 100 if opt["mid"] and opt["mid"] > 0 else None
-
+        est_cost = round(opt["mid"] * 100, 2) if opt.get("mid") else None
         days_to_expiry = (datetime.strptime(expiry, "%Y-%m-%d").date() - date.today()).days
         if days_to_expiry <= 3:
             horizon = "Daytrade (very short)"
@@ -364,24 +417,27 @@ def analyze_ticker(ticker):
         else:
             horizon = "Medium/long-term"
 
+        stars = "⭐" * score
+
         message = (
-            f"📊 {ticker} SIGNAL {'⭐'*score} ({score}/5)\n"
+            f"📊 {ticker} SIGNAL {stars} ({score}/5)\n"
             f"Type: {signal_type}\n"
-            f"Expiration: {expiry_label(expiry)}\n"
+            f"Expiration: {expiry} ({days_to_expiry}d)\n"
             f"Strike: {int(opt['strike'])}\n"
-            f"Instruction: Buy to Open {DEFAULT_QTY} {ticker} {int(opt['strike'])}{'C' if is_call else 'P'} exp {datetime.strptime(expiry, '%Y-%m-%d').strftime('%m/%d/%y')}\n"
+            f"Instruction: Buy to Open {DEFAULT_QTY} {ticker} {int(opt['strike'])}{'C' if is_call else 'P'} exp {datetime.strptime(expiry,'%Y-%m-%d').strftime('%m/%d/%y')}\n"
             f"Entry (spot): {close_price:.2f}\n"
             f"Option mid≈ {opt['mid']:.2f} (bid {opt['bid']:.2f}/ask {opt['ask']:.2f})\n"
             + (f"Est. Cost: ${est_cost:.2f}\n" if est_cost else "")
-            + f"Reason: RSI {rsi_val:.1f}, EMA{EMA_SHORT} {'>' if ema_short_val>ema_long_val else '<'} EMA{EMA_LONG}\n"
+            + f"Reason: {', '.join(reasons)} | Candle: {pattern if pattern else 'None'}\n"
             f"Horizon: {horizon}\n"
             f"Confidence: {score}⭐\n"
+            f"Schwab: Buy to Open {DEFAULT_QTY} {ticker} {int(opt['strike'])}{'C' if is_call else 'P'} exp {datetime.strptime(expiry,'%Y-%m-%d').strftime('%m/%d/%y')}\n"
             f"Note: Use limit orders; this is idea only."
         )
 
-        signature = f"{signal_type}|{expiry}|{int(opt['strike'])}"
+        signature = f"{signal_type}|{expiry}|{int(opt['strike'])}|{ticker}"
         suggestion = {
-            "contract": opt["contract"],
+            "contract": opt.get("contract"),
             "strike": int(opt["strike"]),
             "mid": opt["mid"],
             "bid": opt["bid"],
@@ -397,7 +453,7 @@ def analyze_ticker(ticker):
         traceback.print_exc()
         return None
 
-# ----------------- Command processing via getUpdates -----------------
+# ----------------- Telegram command processing -----------------
 def process_telegram_messages(state):
     last_id = state.get("last_update_id")
     updates = get_updates(offset=(last_id + 1) if last_id else None, timeout=3)
@@ -431,7 +487,6 @@ def process_telegram_messages(state):
             send_telegram("Stars 1-5: 5=very strong, 4=strong, 3=ok, 2=weak, 1=noise.")
             continue
         if low in ("test", "/test"):
-            # immediate fake alert
             send_telegram("🚨 TEST SIGNAL: (Ticker) CALL 100C exp 09/12/25 | Est. Cost: $100 | Confidence: 4⭐")
             continue
         if low == "portfolio":
@@ -453,7 +508,7 @@ def process_telegram_messages(state):
             send_telegram("Alerts resumed.")
             continue
 
-        # track or "i bought ticker" convenience
+        # track or "i bought ticker"
         matched = None
         for t in TICKERS:
             if f" {t.lower()}" in " " + low or low == t.lower() or low.startswith(f"i bought {t.lower()}") or low.startswith(f"track {t.lower()}"):
@@ -537,7 +592,7 @@ def process_telegram_messages(state):
         send_telegram("I didn't understand that. Send 'help' for commands.")
     return state
 
-# ----------------- Monitor tracked positions -----------------
+# ---------------- Monitor tracked positions ----------------
 def monitor_positions(state):
     positions = state.get("positions", {})
     if not positions:
@@ -585,17 +640,22 @@ def monitor_positions(state):
             print("monitor_positions error for", t, e)
     return state
 
-# ----------------- Main run flow -----------------
+# ---------------- Main run flow (single scheduled run) ----------------
 def main_run_once():
     state = load_state()
 
-    # 1) Process any incoming Telegram commands/messages
+    # Process incoming Telegram commands first
     try:
         state = process_telegram_messages(state)
     except Exception as e:
         print("Error processing telegram messages:", e, traceback.format_exc())
 
-    # 2) If alerts enabled, scan tickers
+    # Debug forced test message (quick end-to-end check)
+    if DEBUG_FORCE_TEST:
+        send_telegram(f"🚨 DEBUG TEST: {DEBUG_TEST_TICKER} fake signal ⭐⭐⭐")
+        return state
+
+    # If alerts enabled, scan tickers
     if state.get("alerts_enabled", True):
         last_signals = state.get("last_signals", {})
         last_suggestions = state.get("last_suggestions", {})
@@ -604,110 +664,38 @@ def main_run_once():
             try:
                 res = analyze_ticker(t)
                 if not res:
+                    # no signal for this ticker
                     continue
-                # save last suggestion for track convenience
+                # save last suggestion for convenience (track)
                 last_suggestions[t] = res["suggestion"]
                 sig = res["signature"]
+                # dedupe by signature per ticker
                 if last_signals.get(t) != sig:
+                    # send message
                     send_telegram(res["message"])
                     last_signals[t] = sig
                     new_signals.append(t)
                 else:
-                    print(f"{t}: no change")
+                    print(f"{t}: no change (same signature)")
             except Exception as e:
-                print("Scan error for", t, e)
+                print("Scan error for", t, e, traceback.format_exc())
         state["last_signals"] = last_signals
         state["last_suggestions"] = last_suggestions
         print("Alerts sent for:", new_signals if new_signals else [])
     else:
-        print("Alerts disabled (alerts_enabled=False)")
+        print("Alerts disabled in state (alerts_enabled=False)")
 
-    # 3) Monitor tracked positions (TP/SL)
+    # Monitor tracked positions for TP/SL
     try:
         state = monitor_positions(state)
     except Exception as e:
-        print("monitor_positions failed:", e)
+        print("monitor_positions failed:", e, traceback.format_exc())
 
-    # 4) Save state
+    # Save state
     save_state(state)
     print("Run complete.")
     return state
 
-# ----------------- Optional local immediate listener (if you run locally) -----------------
-def local_listener_mode():
-    """If you run locally and want instant replies, run script with --local.
-       This requires python-telegram-bot to be installed.
-    """
-    if not TELEGRAM_BOTLIB_AVAILABLE:
-        print("Local listener requires python-telegram-bot installed (pip install python-telegram-bot==13.15)")
-        return
-
-    # Simple handlers that call the same logic used by process_telegram_messages.
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    def help_cmd(update, context):
-        update.message.reply_text("Commands: help, test, track TICKER, stop TICKER, portfolio, status TICKER, close TICKER")
-    def test_cmd(update, context):
-        update.message.reply_text("🚨 TEST ALERT: (Ticker) CALL 100C exp 09/12/25 | Est. Cost: $100 | Confidence: 4⭐")
-    def track_cmd(update, context):
-        args = context.args
-        if not args:
-            update.message.reply_text("Usage: /track TSLA")
-            return
-        t = args[0].upper()
-        state = load_state()
-        last_sugg = state.get("last_suggestions", {}).get(t)
-        if not last_sugg:
-            update.message.reply_text(f"No suggestion for {t} yet.")
-            return
-        pos = state.get("positions", {})
-        pos[t] = {
-            "contract": last_sugg["contract"],
-            "strike": last_sugg["strike"],
-            "mid": last_sugg["mid"],
-            "entry_mid": last_sugg["mid"],
-            "qty": DEFAULT_QTY,
-            "opened_at": datetime.utcnow().isoformat(),
-            "expiry": last_sugg["expiry"],
-            "type": last_sugg["type"],
-            "tp_notified": False,
-            "sl_notified": False,
-            "tracked_by": update.message.from_user.username if update.message.from_user else "user"
-        }
-        state["positions"] = pos
-        save_state(state)
-        update.message.reply_text(f"✅ Now tracking {t} {pos[t]['type']} {pos[t]['strike']} exp {pos[t]['expiry']}")
-    def stop_cmd(update, context):
-        args = context.args
-        if not args:
-            update.message.reply_text("Usage: /stop TSLA")
-            return
-        t = args[0].upper()
-        state = load_state()
-        if t in state.get("positions", {}):
-            state["positions"].pop(t, None)
-            save_state(state)
-            update.message.reply_text(f"🛑 Stopped tracking {t}")
-        else:
-            update.message.reply_text(f"I wasn't tracking {t}")
-
-    dp.add_handler(CommandHandler("help", help_cmd))
-    dp.add_handler(CommandHandler("test", test_cmd))
-    dp.add_handler(CommandHandler("track", track_cmd))
-    dp.add_handler(CommandHandler("stop", stop_cmd))
-    dp.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Bot running locally.")))
-
-    print("Starting local listener (polling). Press Ctrl+C to stop.")
-    updater.start_polling()
-    updater.idle()
-
-# ----------------- Entry point -----------------
+# ---------------- Entry point ----------------
 if __name__ == "__main__":
-    import sys
-    # If user runs with "--local" argument, start local listener mode (instant).
-    if len(sys.argv) > 1 and sys.argv[1] in ("--local", "-l"):
-        local_listener_mode()
-    else:
-        # normal scheduled-run mode: run once (good for GitHub Actions schedule)
-        main_run_once()
+    main_run_once()
